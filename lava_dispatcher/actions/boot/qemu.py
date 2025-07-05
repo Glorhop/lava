@@ -17,10 +17,10 @@ import time
 from typing import TYPE_CHECKING, List
 
 import pexpect
-
 from lava_common.constants import DISPATCHER_DOWNLOAD_DIR, SYS_CLASS_KVM
 from lava_common.exceptions import JobError
 from lava_common.utils import debian_package_arch, debian_package_version
+
 from lava_dispatcher.action import Action, Pipeline
 from lava_dispatcher.actions.boot import AutoLoginAction, BootHasMixin, OverlayUnpack
 from lava_dispatcher.actions.boot.environment import ExportDeviceEnvironment
@@ -200,9 +200,7 @@ class SocketServerForSerial:
     def listen(self):
         self.sock.bind(self.socket_address)
         self.sock.listen()
-        self.logger.debug(
-            f"SocketServerForSerial listening on {self.socket_address}"
-        )
+        self.logger.debug(f"SocketServerForSerial listening on {self.socket_address}")
         while True:
             conn, addr = self.sock.accept()
             self.logger.debug(f"SocketServerForSerial accepted connection from {addr}")
@@ -683,20 +681,29 @@ class CallQemuAction(Action):
         )
 
         # Inject faults into qemu virtual machine
-        # Get the file system path
-        rootfs_url = self.job.parameters["actions"][0]["deploy"]["images"].get(
-            "rootfs"
-        )["url"]
+        try:
+            # Get the file system path
+            rootfs_url = self.job.parameters["actions"][0]["deploy"]["images"].get(
+                "rootfs"
+            )["url"]
 
-        fault_inject_params = self.job.parameters["actions"][1]["boot"].get(
-            "fault_inject_params", {}
-        )
-        prompts = self.job.parameters["actions"][1]["boot"].get("prompts", [])[0]
-        password = (
-            self.job.parameters["actions"][1]["boot"]
-            .get("auto_login", {})
-            .get("password", "519ailab")
-        )
+            fault_inject_params = self.job.parameters["actions"][1]["boot"].get(
+                "fault_inject_params", {}
+            )
+            prompts = self.job.parameters["actions"][1]["boot"].get("prompts", [])[0]
+            password = (
+                self.job.parameters["actions"][1]["boot"]
+                .get("auto_login", {})
+                .get("password", "519ailab")
+            )
+            username = (
+                self.job.parameters["actions"][1]["boot"]
+                .get("auto_login", {})
+                .get("username", "root")
+            )
+        except Exception as e:
+            self.logger.error(f"QEMU boot error: {e}")
+            return shell_connection
         # Returns the injected command, otherwise returns an empty list
         inject_command = fault_inject_params.get("commands", [])
         # stdout: /tmp/test.out
@@ -806,7 +813,9 @@ class CallQemuAction(Action):
 
         # Start a thread to listen the socket server and get the response
         try:
-            socket_server = SocketServerForSerial(shell, self.logger, fault_inject_params.get("serial_socket"))
+            socket_server = SocketServerForSerial(
+                shell, self.logger, fault_inject_params.get("serial_socket")
+            )
             socket_thread = threading.Thread(target=socket_server.listen, args=())
             socket_thread.daemon = True  # Set as daemon thread so it will terminate when main program exits
             socket_thread.start()
@@ -840,8 +849,12 @@ class CallQemuAction(Action):
             except Exception as e:
                 self.logger.error("Appinject got exception: %s", str(e))
         else:
-            # Delayed execution of the inject action
+            params = fault_inject_params
+            params["password"] = password
+            params["username"] = username
+            params["prompts"] = prompts
             if delayed != "":
+                # Delayed execution of the inject action
                 timer = TimerWithCallback(
                     parse_time_string(delayed),
                     fault_inject_callback,
@@ -849,6 +862,7 @@ class CallQemuAction(Action):
                     log_stdout,
                     log_stderr,
                     self.logger,
+                    params,
                 )
                 timer.start()
             else:
@@ -859,7 +873,7 @@ class CallQemuAction(Action):
                         log_stdout,
                         log_stderr,
                         self.logger,
-                        fault_inject_params,
+                        params,
                     ],
                     daemon=True,
                 )
@@ -906,6 +920,7 @@ def fault_inject_callback(flipshell, log_stdout, log_stderr, logger, params):
     :param log_stdout: Path to stdout log file
     :param log_stderr: Path to stderr log file
     :param logger: Logger instance
+    :param params: The `fault_inject_params` in job definition YAML and some additional parameters in job definition YAML
     """
     try:
         # Extract gdb binary and commands from flipshell
@@ -931,8 +946,8 @@ def fault_inject_callback(flipshell, log_stdout, log_stderr, logger, params):
             return
 
         if params.get("inject_after_boot", False):
-            ssh_host = params.get("ssh_host", 22)
-            ssh_port = params.get("ssh_port", "localhost")
+            ssh_host = params.get("ssh_host", "localhost")
+            ssh_port = params.get("ssh_port", 22)
             logger.debug(
                 f"Wait for boot completion by checking ssh: host {ssh_host}, port {ssh_port}"
             )
@@ -944,8 +959,8 @@ def fault_inject_callback(flipshell, log_stdout, log_stderr, logger, params):
         time.sleep(5)
         logger.debug("Starting gdb-multiarch with pexpect, commands: %s", gdb_commands)
 
-        # Start gdb-multiarch with pexpect
-        with open(log_stdout, "wb") as stdout, open(log_stderr, "wb") as stderr:
+        with open(log_stdout, "wb") as stdout, open(log_stderr, "wb") as _stderr:
+            # Start gdb-multiarch with pexpect
             gdb_process = pexpect.spawn("gdb-multiarch", ["-q"])
             gdb_process.logfile = stdout
 
@@ -953,27 +968,101 @@ def fault_inject_callback(flipshell, log_stdout, log_stderr, logger, params):
             gdb_process.expect(r"\(gdb\)\s*")
             logger.debug("GDB started and ready")
 
+            # Start ssh with pexpect
+            host = f"{params.get('username')}@{params.get('ssh_host')}"
+            ssh_process = pexpect.spawn(
+                "ssh",
+                [
+                    "-o",
+                    "StrictHostKeyChecking=no",
+                    "-p",
+                    str(params.get("ssh_port")),
+                    host,
+                ],
+            )
+            ssh_process.logfile = stdout
+            ssh_process.expect(host)
+            ssh_process.sendline(params.get("password", "root"))
+            ssh_process.expect(params.get("prompt", "root@rros"))
+            logger.debug("SSH connect to qemu success")
+
             # Execute each command one by one
             for cmd in gdb_commands:
-                logger.debug("Executing GDB command: %s", cmd)
-                gdb_process.sendline(cmd)
+                if cmd.strip().startswith("sshcommand"):
+                    # Send ctrl+c and continue to gdb, let ssh command run in qemu
+                    gdb_process.sendcontrol("c")
+                    gdb_process.expect(r"\(gdb\)\s*")
+                    gdb_process.sendline("continue")
 
-                # Wait for the (gdb) prompt to ensure command completion
-                try:
-                    gdb_process.expect(r"\(gdb\)\s*", timeout=30)
-                    logger.debug("Command completed: %s", cmd)
-                except pexpect.TIMEOUT:
-                    logger.warning("Timeout waiting for command completion: %s", cmd)
-                    # Continue with next command even if timeout
-                except pexpect.EOF:
-                    logger.info("GDB process ended after command: %s", cmd)
-                    break
+                    logger.debug(
+                        "[fault_inject_callback] Executing SSH command: %s", cmd
+                    )
+                    if len(cmd.split("sshcommand ")) == 2:
+                        ssh_process.sendline(cmd.split("sshcommand ")[1])
+                        logger.debug(f"[fault_inject_callback] Send SSH command: {cmd}")
+                    else:
+                        logger.error(
+                            "[fault_inject_callback] command should look like: 'sshcommand <your command>'"
+                        )
+
+                    # Wait for the ssh prompt to ensure command completion
+                    try:
+                        ssh_process.expect(
+                            params.get("prompt", "root@rros"), timeout=30
+                        )
+                        logger.debug(
+                            "[fault_inject_callback] SSH command completed: %s", cmd
+                        )
+                    except pexpect.TIMEOUT:
+                        logger.warning(
+                            "[fault_inject_callback] Timeout waiting for SSH command completion: %s",
+                            cmd,
+                        )
+                        # Continue with next command even if timeout
+                    except pexpect.EOF:
+                        logger.info(
+                            "[fault_inject_callback] SSH process ended after command: %s",
+                            cmd,
+                        )
+
+                    # Send ctrl+c to GDB
+                    gdb_process.sendcontrol("c")
+                    gdb_process.expect(r"\(gdb\)\s*")
+                else:
+                    logger.debug(
+                        "[fault_inject_callback] Executing GDB command: %s", cmd
+                    )
+                    gdb_process.sendline(cmd)
+
+                    # Wait for the (gdb) prompt to ensure command completion
+                    try:
+                        gdb_process.expect(r"\(gdb\)\s*", timeout=30)
+                        logger.debug(
+                            "[fault_inject_callback] GDB command completed: %s", cmd
+                        )
+                    except pexpect.TIMEOUT:
+                        logger.warning(
+                            "[fault_inject_callback] Timeout waiting for GDB command completion: %s",
+                            cmd,
+                        )
+                        # Continue with next command even if timeout
+                    except pexpect.EOF:
+                        logger.info(
+                            "[fault_inject_callback] GDB process ended after command: %s",
+                            cmd,
+                        )
 
             # Ensure gdb exits cleanly if still running
             if gdb_process.isalive():
-                logger.debug("Closing GDB process")
+                logger.debug("[fault_inject_callback] Closing GDB process")
 
                 gdb_process.close()
+
+            # Free ssh_process
+            if ssh_process.isalive():
+                logger.debug("[fault_inject_callback] Closing SSH process")
+
+                ssh_process.close()
 
     except Exception as e:
         logger.error("Error in fault injection: %s", str(e))
